@@ -7761,12 +7761,23 @@ fn ai_page(cx: &App) -> SettingsPage {
                     title: "Auto Compact",
                     description: "Automatically compact the agent's context when it grows too large, summarizing earlier messages to free up room in the model's context window.",
                     field: Box::new(SettingField {
-                        json_path: Some("agent.auto_compact"),
+                        json_path: Some("agent.auto_compact.enabled"),
                         pick: |settings_content| {
-                            settings_content.agent.as_ref()?.auto_compact.as_ref()
+                            settings_content
+                                .agent
+                                .as_ref()?
+                                .auto_compact
+                                .as_ref()?
+                                .enabled
+                                .as_ref()
                         },
                         write: |settings_content, value, _| {
-                            settings_content.agent.get_or_insert_default().auto_compact = value;
+                            settings_content
+                                .agent
+                                .get_or_insert_default()
+                                .auto_compact
+                                .get_or_insert_default()
+                                .enabled = value;
                         },
                     }),
                     metadata: None,
@@ -7776,19 +7787,23 @@ fn ai_page(cx: &App) -> SettingsPage {
                     title: "Auto Compact Threshold",
                     description: "When auto compaction runs. A decimal from 0 to 1 is a percentage of the context window (e.g. 0.8 = 80% full). An integer above 1 is the number of used tokens to compact after. A negative integer is the number of tokens remaining in the context window before compacting.",
                     field: Box::new(SettingField {
-                        json_path: Some("agent.auto_compact_threshold"),
+                        json_path: Some("agent.auto_compact.threshold"),
                         pick: |settings_content| {
                             settings_content
                                 .agent
                                 .as_ref()?
-                                .auto_compact_threshold
+                                .auto_compact
+                                .as_ref()?
+                                .threshold
                                 .as_ref()
                         },
                         write: |settings_content, value, _| {
                             settings_content
                                 .agent
                                 .get_or_insert_default()
-                                .auto_compact_threshold = value;
+                                .auto_compact
+                                .get_or_insert_default()
+                                .threshold = value;
                         },
                     }),
                     metadata: None,
