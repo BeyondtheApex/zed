@@ -35,6 +35,22 @@ impl FeatureFlag for AgentSharingFeatureFlag {
 }
 register_feature_flag!(AgentSharingFeatureFlag);
 
+/// Gates the agent "handoffs" feature, including automatic context compaction.
+///
+/// We reuse this feature flag for related handoff betas, so don't delete it if
+/// it is not currently in use.
+pub struct HandoffFeatureFlag;
+
+impl FeatureFlag for HandoffFeatureFlag {
+    const NAME: &'static str = "handoff";
+    type Value = PresenceFlag;
+
+    fn enabled_for_staff() -> bool {
+        false
+    }
+}
+register_feature_flag!(HandoffFeatureFlag);
+
 pub struct DiffReviewFeatureFlag;
 
 impl FeatureFlag for DiffReviewFeatureFlag {

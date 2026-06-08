@@ -162,6 +162,30 @@ pub struct AgentSettingsContent {
     /// Default: []
     #[serde(default)]
     pub model_parameters: Vec<LanguageModelParameters>,
+    /// Whether to automatically compact the agent's context when it grows too
+    /// large, summarizing earlier messages to free up room in the model's
+    /// context window.
+    ///
+    /// Default: false
+    pub auto_compact: Option<bool>,
+    /// The threshold at which auto-compaction runs. This is interpreted in one
+    /// of three ways depending on its value:
+    ///
+    /// - A decimal from 0 to 1 (inclusive) is treated as a percentage of the
+    ///   model's context window. For example, `0.8` compacts once the context
+    ///   is 80% full.
+    /// - An integer greater than 1 is treated as an absolute number of tokens:
+    ///   compaction runs once the context exceeds that many tokens. For
+    ///   example, `100000` compacts after 100,000 tokens are used.
+    /// - A negative integer is treated as a number of tokens *remaining* in the
+    ///   context window: compaction runs once fewer than that many tokens are
+    ///   left. For example, `-20000` compacts once there are fewer than 20,000
+    ///   tokens of headroom left in the context window.
+    ///
+    /// Only has an effect when `auto_compact` is enabled.
+    ///
+    /// Default: 0.8
+    pub auto_compact_threshold: Option<f64>,
     /// Whether to show thumb buttons for feedback in the agent panel.
     ///
     /// Default: true

@@ -1106,6 +1106,20 @@
     },
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
+    // Whether to automatically compact the agent's context when it grows too
+    // large, summarizing earlier messages to free up room in the model's
+    // context window.
+    "auto_compact": false,
+    // The threshold at which auto-compaction runs, interpreted in one of three
+    // ways depending on its value:
+    //   - A decimal from 0 to 1 is a percentage of the model's context window
+    //     (e.g. 0.8 compacts once the context is 80% full).
+    //   - An integer greater than 1 is an absolute number of used tokens to
+    //     compact after (e.g. 100000 compacts after 100,000 tokens are used).
+    //   - A negative integer is a number of tokens remaining in the context
+    //     window (e.g. -20000 compacts once fewer than 20,000 tokens are left).
+    // Only has an effect when "auto_compact" is enabled.
+    "auto_compact_threshold": 0.8,
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,
     "default_profile": "write",
