@@ -1657,6 +1657,40 @@ pub enum WindowKind {
     /// A window that appears on top of its parent window and blocks interaction with it
     /// until the modal window is closed
     Dialog,
+
+    /// A transparent overlay window rendered via DirectComposition.
+    /// Designed for game overlays, performance monitors, and other
+    /// always-on-top HUDs that should not interfere with the underlying
+    /// application.
+    #[cfg(all(target_os = "windows", feature = "overlay"))]
+    Overlay(OverlayConfig),
+}
+
+/// Configuration for an overlay window.
+#[cfg(all(target_os = "windows", feature = "overlay"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayConfig {
+    /// When true, mouse events pass through to windows underneath.
+    pub click_through: bool,
+    /// Controls how the swap chain presents frames.
+    pub present_mode: OverlayPresentMode,
+}
+
+/// Frame presentation strategy for overlay windows.
+#[cfg(all(target_os = "windows", feature = "overlay"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayPresentMode {
+    /// Sync to DWM compositor cadence (SyncInterval=1, power-efficient).
+    CompositedVSync,
+    /// Non-blocking present for lowest latency (SyncInterval=0).
+    /// `allow_tearing` requires DXGI `CheckFeatureSupport` at swapchain creation.
+    LowLatency {
+        /// Enables `DXGI_PRESENT_ALLOW_TEARING`.
+        /// Only active if the system supports it.
+        allow_tearing: bool,
+    },
+    /// Only calls Present when UI content has changed.
+    EventDriven,
 }
 
 /// The appearance of the window, as defined by the operating system.

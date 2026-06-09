@@ -53,6 +53,34 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    #[cfg(feature = "overlay")]
+    present_mode: PresentMode,
+    #[cfg(feature = "overlay")]
+    needs_present: bool,
+}
+
+/// Controls how frames are presented to the swap chain.
+#[cfg(feature = "overlay")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentMode {
+    /// SyncInterval=1, blocks until VSync.
+    CompositedVSync,
+    /// SyncInterval=0, does not block. ALLOW_TEARING only when:
+    /// system supports it + user enabled + SyncInterval == 0.
+    LowLatency { allow_tearing: bool },
+    /// Only calls Present when `needs_present` flag is set.
+    EventDriven,
+}
+
+#[cfg(feature = "overlay")]
+impl From<OverlayPresentMode> for PresentMode {
+    fn from(mode: OverlayPresentMode) -> Self {
+        match mode {
+            OverlayPresentMode::CompositedVSync => PresentMode::CompositedVSync,
+            OverlayPresentMode::LowLatency { allow_tearing } => PresentMode::LowLatency { allow_tearing },
+            OverlayPresentMode::EventDriven => PresentMode::EventDriven,
+        }
+    }
 }
 
 /// Direct3D objects
@@ -68,6 +96,8 @@ pub(crate) struct DirectXRendererDevices {
 struct DirectXResources {
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
+    /// Flags used when creating the swap chain (must match in ResizeBuffers)
+    swap_chain_flags: DXGI_SWAP_CHAIN_FLAG,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -135,6 +165,8 @@ impl DirectXRenderer {
         hwnd: HWND,
         directx_devices: &DirectXDevices,
         disable_direct_composition: bool,
+        initial_width: u32,
+        initial_height: u32,
     ) -> Result<Self> {
         if disable_direct_composition {
             log::info!("Direct Composition is disabled.");
@@ -144,8 +176,14 @@ impl DirectXRenderer {
             .context("Creating DirectX devices")?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
-        let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
-            .context("Creating DirectX resources")?;
+        let resources = DirectXResources::new(
+            &devices,
+            initial_width,
+            initial_height,
+            hwnd,
+            disable_direct_composition,
+        )
+        .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
@@ -171,9 +209,13 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
-            width: 1,
-            height: 1,
+            width: initial_width,
+            height: initial_height,
             skip_draws: false,
+            #[cfg(feature = "overlay")]
+            present_mode: PresentMode::CompositedVSync,
+            #[cfg(feature = "overlay")]
+            needs_present: false,
         })
     }
 
@@ -217,14 +259,51 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
+        #[cfg(feature = "overlay")]
+        {
+            if self.present_mode == PresentMode::EventDriven && !self.needs_present {
+                return Ok(());
+            }
+            self.needs_present = false;
+        }
+
+        let (sync_interval, flags) = {
+            #[cfg(feature = "overlay")]
+            {
+                match self.present_mode {
+                    PresentMode::CompositedVSync | PresentMode::EventDriven => (1, DXGI_PRESENT(0)),
+                    PresentMode::LowLatency { allow_tearing } => {
+                        let flags = if allow_tearing {
+                            DXGI_PRESENT_ALLOW_TEARING
+                        } else {
+                            DXGI_PRESENT_DO_NOT_WAIT
+                        };
+                        (0, flags)
+                    }
+                }
+            }
+            #[cfg(not(feature = "overlay"))]
+            (0, DXGI_PRESENT(0))
+        };
+
         let result = unsafe {
             self.resources
                 .as_ref()
                 .expect("resources missing")
                 .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+                .Present(sync_interval, flags)
         };
         result.ok().context("Presenting swap chain failed")
+    }
+
+    #[cfg(feature = "overlay")]
+    pub(crate) fn set_present_mode(&mut self, mode: PresentMode) {
+        self.present_mode = mode;
+    }
+
+    #[cfg(feature = "overlay")]
+    pub(crate) fn mark_needs_present(&mut self) {
+        self.needs_present = true;
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
@@ -364,31 +443,45 @@ impl DirectXRenderer {
         self.width = width;
         self.height = height;
 
-        // Clear the render target before resizing
+        // Release all indirect references to the swap chain before resizing,
+        // as required by DXGI (MSDN: ResizeBuffers remarks).
+        // This includes:
+        //   a) DirectComposition visual content (SetContent + Commit)
+        //   b) D3D11 pipeline state (ClearState)
+        //   c) Back buffer & RTV (take)
+        if let Some(ref dc) = self.direct_composition {
+            dc.clear_swap_chain()
+                .context("Clearing DirectComposition content before resize")?;
+        }
+
         let devices = self.devices.as_ref().context("devices missing")?;
-        unsafe { devices.device_context.OMSetRenderTargets(None, None) };
+        unsafe {
+            devices.device_context.ClearState();
+            devices.device_context.Flush();
+        }
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.render_target.take();
         resources.render_target_view.take();
 
-        // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
-        // The app might have moved to a monitor that's attached to a different graphics device.
-        // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
-        // But here we just return the error, because we are handling device lost scenarios elsewhere.
         unsafe {
             resources
                 .swap_chain
                 .ResizeBuffers(
-                    BUFFER_COUNT as u32,
+                    0, // preserve existing buffer count
                     width,
                     height,
-                    RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    DXGI_FORMAT_UNKNOWN, // preserve existing format
+                    resources.swap_chain_flags,
                 )
                 .context("Failed to resize swap chain")?;
         }
 
         resources.recreate_resources(devices, width, height)?;
+
+        if let Some(ref dc) = self.direct_composition {
+            dc.rebind_swap_chain(&resources.swap_chain)
+                .context("Re-binding DirectComposition swap chain after resize")?;
+        }
 
         unsafe {
             devices
@@ -762,6 +855,24 @@ impl DirectXResources {
         hwnd: HWND,
         disable_direct_composition: bool,
     ) -> Result<Self> {
+        // Determine swap chain flags (must match what create_swap_chain_for_composition uses)
+        let allow_tearing = {
+            let mut supported: u32 = 0;
+            unsafe {
+                devices.dxgi_factory.CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    &mut supported as *mut _ as *mut _,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            }
+            .is_ok_and(|_| supported != 0)
+        };
+        let swap_chain_flags = if allow_tearing {
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        } else {
+            DXGI_SWAP_CHAIN_FLAG(0)
+        };
+
         let swap_chain = if disable_direct_composition {
             create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
         } else {
@@ -786,6 +897,7 @@ impl DirectXResources {
 
         Ok(Self {
             swap_chain,
+            swap_chain_flags,
             render_target: Some(render_target),
             render_target_view,
             path_intermediate_texture,
@@ -912,6 +1024,31 @@ impl DirectComposition {
         unsafe {
             self.comp_visual.SetContent(swap_chain)?;
             self.comp_target.SetRoot(&self.comp_visual)?;
+            self.comp_device.Commit()?;
+        }
+        Ok(())
+    }
+
+    /// Unbind the swap chain from DirectComposition visual.
+    /// Call before ResizeBuffers(), which would otherwise fail
+    /// because the swap chain is in use by the compositor.
+    pub fn clear_swap_chain(&self) -> Result<()> {
+        unsafe {
+            // Pass None typed as &IUnknown to clear the visual content.
+            // Cannot use None::<&IDXGISwapChain1> because SetContent
+            // expects Param<IUnknown>, not Param<IDXGISwapChain1>.
+            self.comp_visual
+                .SetContent(None::<&windows::core::IUnknown>)?;
+            self.comp_device.Commit()?;
+        }
+        Ok(())
+    }
+
+    /// Re-bind the swap chain after ResizeBuffers().
+    /// Does NOT call SetRoot (the visual is already the root target).
+    pub fn rebind_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
+        unsafe {
+            self.comp_visual.SetContent(swap_chain)?;
             self.comp_device.Commit()?;
         }
         Ok(())
@@ -1182,6 +1319,18 @@ fn create_swap_chain_for_composition(
     width: u32,
     height: u32,
 ) -> Result<IDXGISwapChain1> {
+    let allow_tearing = {
+        let mut supported: u32 = 0;
+        unsafe {
+            dxgi_factory.CheckFeatureSupport(
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                &mut supported as *mut _ as *mut _,
+                std::mem::size_of::<u32>() as u32,
+            )
+        }
+        .is_ok_and(|_| supported != 0)
+    };
+
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
         Height: height,
@@ -1197,7 +1346,11 @@ fn create_swap_chain_for_composition(
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
+        Flags: if allow_tearing {
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+        } else {
+            0
+        },
     };
     Ok(unsafe { dxgi_factory.CreateSwapChainForComposition(device, &desc, None)? })
 }

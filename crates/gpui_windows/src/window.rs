@@ -84,6 +84,8 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+    #[cfg(feature = "overlay")]
+    pub(crate) overlay_present_mode: OverlayPresentMode,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -113,27 +115,34 @@ impl WindowsWindowState {
         appearance: WindowAppearance,
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
+        #[cfg(feature = "overlay")] overlay_present_mode: OverlayPresentMode,
     ) -> Result<Self> {
         let scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
             monitor_dpi / USER_DEFAULT_SCREEN_DPI as f32
         };
         let origin = logical_point(window_params.x as f32, window_params.y as f32, scale_factor);
-        let logical_size = {
-            let physical_size = size(
-                DevicePixels(window_params.cx),
-                DevicePixels(window_params.cy),
-            );
-            physical_size.to_pixels(scale_factor)
-        };
+        let physical_size = size(
+            DevicePixels(window_params.cx),
+            DevicePixels(window_params.cy),
+        );
+        let logical_size = physical_size.to_pixels(scale_factor);
         let fullscreen_restore_bounds = Bounds {
             origin,
             size: logical_size,
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let mut renderer = DirectXRenderer::new(
+            hwnd,
+            directx_devices,
+            disable_direct_composition,
+            physical_size.width.0.max(1) as u32,
+            physical_size.height.0.max(1) as u32,
+        )
+        .context("Creating DirectX renderer")?;
+        #[cfg(feature = "overlay")]
+        renderer.set_present_mode(overlay_present_mode.into());
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -178,6 +187,8 @@ impl WindowsWindowState {
             invalidate_devices,
             direct_manipulation,
             a11y: RefCell::new(None),
+            #[cfg(feature = "overlay")]
+            overlay_present_mode,
         })
     }
 
@@ -253,6 +264,8 @@ impl WindowsWindowInner {
             context.appearance,
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
+            #[cfg(feature = "overlay")]
+            context.overlay_present_mode,
         )?;
 
         Ok(Rc::new(Self {
@@ -397,6 +410,8 @@ struct WindowCreateContext {
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
     parent_hwnd: Option<HWND>,
+    #[cfg(feature = "overlay")]
+    overlay_present_mode: OverlayPresentMode,
 }
 
 impl WindowsWindow {
@@ -449,6 +464,8 @@ impl WindowsWindow {
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
+        } else if let Some(style) = overlay_window_style(&params.kind) {
+            style
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -500,6 +517,8 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
             parent_hwnd,
+            #[cfg(feature = "overlay")]
+            overlay_present_mode: overlay_present_mode_from_kind(&params.kind),
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -1565,6 +1584,32 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
         unsafe { SetPropW(hwnd, w!("NonRudeHWND"), Some(HANDLE(1 as _))) }.log_err();
     } else {
         unsafe { RemovePropW(hwnd, w!("NonRudeHWND")) }.log_err();
+    }
+}
+
+/// Returns the window style for an overlay window, if `kind` is `WindowKind::Overlay`.
+fn overlay_window_style(kind: &WindowKind) -> Option<(WINDOW_EX_STYLE, WINDOW_STYLE)> {
+    #[cfg(feature = "overlay")]
+    if let WindowKind::Overlay(config) = kind {
+        let mut dwex = WS_EX_TOPMOST
+            | WS_EX_NOACTIVATE
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOREDIRECTIONBITMAP;
+        if config.click_through {
+            dwex |= WS_EX_TRANSPARENT;
+        }
+        return Some((dwex, WS_POPUP));
+    }
+    let _ = kind; // used only in cfg(feature = "overlay") above
+    None
+}
+
+#[cfg(feature = "overlay")]
+fn overlay_present_mode_from_kind(kind: &WindowKind) -> OverlayPresentMode {
+    if let WindowKind::Overlay(config) = kind {
+        config.present_mode
+    } else {
+        OverlayPresentMode::CompositedVSync
     }
 }
 
