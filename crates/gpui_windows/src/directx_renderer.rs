@@ -386,8 +386,6 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
         if self.skip_draws {
-            // skip drawing this frame, we just recovered from a device lost event
-            // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
         self.pre_draw(&match background_appearance {
@@ -874,8 +872,10 @@ impl DirectXResources {
         };
 
         let swap_chain = if disable_direct_composition {
+            log::info!("DirectXResources: using HWND swap chain (ALPHA_MODE_IGNORE — no transparency)");
             create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
         } else {
+            log::info!("DirectXResources: using composition swap chain (ALPHA_MODE_PREMULTIPLIED)");
             create_swap_chain_for_composition(
                 &devices.dxgi_factory,
                 &devices.device,

@@ -115,6 +115,7 @@ impl WindowsWindowState {
         appearance: WindowAppearance,
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
+        background_appearance: WindowBackgroundAppearance,
         #[cfg(feature = "overlay")] overlay_present_mode: OverlayPresentMode,
     ) -> Result<Self> {
         let scale_factor = {
@@ -163,7 +164,7 @@ impl WindowsWindowState {
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
             border_offset,
             appearance: Cell::new(appearance),
-            background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            background_appearance: Cell::new(background_appearance),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -253,6 +254,11 @@ impl WindowsWindowState {
 
 impl WindowsWindowInner {
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
+        #[cfg(feature = "overlay")]
+        let is_overlay = matches!(context.overlay_present_mode, OverlayPresentMode::CompositedVSync | OverlayPresentMode::LowLatency { .. } | OverlayPresentMode::EventDriven);
+        #[cfg(not(feature = "overlay"))]
+        let is_overlay = false;
+
         let state = WindowsWindowState::new(
             hwnd,
             &context.directx_devices,
@@ -264,6 +270,11 @@ impl WindowsWindowInner {
             context.appearance,
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
+            if is_overlay {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
             #[cfg(feature = "overlay")]
             context.overlay_present_mode,
         )?;
@@ -433,6 +444,14 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
         } = creation_info;
+        // Overlay windows MUST use DirectComposition (composition swap chain).
+        // Regular HWND swap chains use ALPHA_MODE_IGNORE which discards alpha,
+        // making transparent backgrounds impossible.
+        let disable_direct_composition = if let WindowKind::Overlay(_) = &params.kind {
+            false
+        } else {
+            disable_direct_composition
+        };
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
@@ -520,10 +539,15 @@ impl WindowsWindow {
             #[cfg(feature = "overlay")]
             overlay_present_mode: overlay_present_mode_from_kind(&params.kind),
         };
+        let class_name = if let WindowKind::Overlay(_) = &params.kind {
+            OVERLAY_WINDOW_CLASS_NAME
+        } else {
+            WINDOW_CLASS_NAME
+        };
         let creation_result = unsafe {
             CreateWindowExW(
                 dwexstyle,
-                WINDOW_CLASS_NAME,
+                class_name,
                 &window_name,
                 dwstyle,
                 CW_USEDEFAULT,
@@ -546,6 +570,12 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+        #[cfg(feature = "overlay")]
+        if let WindowKind::Overlay(_) = &params.kind {
+            // Must call set_window_composition_attribute to actually
+            // tell DWM the window is transparent (not just set the Cell).
+            set_window_composition_attribute(hwnd, None, 2);
+        }
         this.state.border_offset.update(hwnd)?;
         let placement = retrieve_window_placement(
             hwnd,
@@ -1339,6 +1369,7 @@ enum WindowOpenState {
 }
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");
+const OVERLAY_WINDOW_CLASS_NAME: PCWSTR = w!("Zed::OverlayWindow");
 
 fn register_window_class(icon_handle: HICON) {
     static ONCE: Once = Once::new();
@@ -1353,6 +1384,20 @@ fn register_window_class(icon_handle: HICON) {
             ..Default::default()
         };
         unsafe { RegisterClassW(&wc) };
+
+        // Overlay windows need a transparent background so that areas
+        // outside the DirectComposition visual (e.g. rounded corners)
+        // are not painted with the default background brush.
+        let overlay_wc = WNDCLASSW {
+            lpfnWndProc: Some(window_procedure),
+            hIcon: icon_handle,
+            lpszClassName: PCWSTR(OVERLAY_WINDOW_CLASS_NAME.as_ptr()),
+            style: CS_HREDRAW | CS_VREDRAW,
+            hInstance: get_module_handle().into(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()), // NULL_BRUSH — transparent
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&overlay_wc) };
     });
 }
 
@@ -1593,8 +1638,7 @@ fn overlay_window_style(kind: &WindowKind) -> Option<(WINDOW_EX_STYLE, WINDOW_ST
     if let WindowKind::Overlay(config) = kind {
         let mut dwex = WS_EX_TOPMOST
             | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW
-            | WS_EX_NOREDIRECTIONBITMAP;
+            | WS_EX_TOOLWINDOW;
         if config.click_through {
             dwex |= WS_EX_TRANSPARENT;
         }
