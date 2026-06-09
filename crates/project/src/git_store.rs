@@ -35,10 +35,10 @@ use git::{
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
-        CommitOptions, CreateWorktreeTarget, DiffType, FetchOptions, GitCommitTemplate,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
-        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
+        CommitOptions, CreateWorktreeTarget, DiffType, FetchOptions, FileHistoryChangedFileSets,
+        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
+        LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
+        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -860,6 +860,17 @@ impl GitStore {
             .map(|id| self.repositories[id].clone())
     }
 
+    fn file_is_symlink(file: &File, cx: &App) -> bool {
+        file.worktree
+            .read(cx)
+            .entry_for_path(&file.path)
+            .is_some_and(|entry| entry.canonical_path.is_some())
+    }
+
+    fn buffer_is_symlink(buffer: &Entity<Buffer>, cx: &App) -> bool {
+        File::from_dyn(buffer.read(cx).file()).is_some_and(|file| Self::file_is_symlink(file, cx))
+    }
+
     pub fn open_unstaged_diff(
         &mut self,
         buffer: Entity<Buffer>,
@@ -890,13 +901,18 @@ impl GitStore {
             return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
         };
 
+        let is_symlink = Self::buffer_is_symlink(&buffer, cx);
         let task = self
             .loading_diffs
             .entry((buffer_id, DiffKind::Unstaged))
             .or_insert_with(|| {
-                let staged_text = repo.update(cx, |repo, cx| {
-                    repo.load_staged_text(buffer_id, repo_path, cx)
-                });
+                let staged_text = if is_symlink {
+                    Task::ready(Ok(None))
+                } else {
+                    repo.update(cx, |repo, cx| {
+                        repo.load_staged_text(buffer_id, repo_path, cx)
+                    })
+                };
                 cx.spawn(async move |this, cx| {
                     Self::open_diff_internal(
                         this,
@@ -1048,13 +1064,18 @@ impl GitStore {
             return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
         };
 
+        let is_symlink = Self::buffer_is_symlink(&buffer, cx);
         let task = self
             .loading_diffs
             .entry((buffer_id, DiffKind::Uncommitted))
             .or_insert_with(|| {
-                let changes = repo.update(cx, |repo, cx| {
-                    repo.load_committed_text(buffer_id, repo_path, cx)
-                });
+                let changes = if is_symlink {
+                    Task::ready(Ok(DiffBasesChange::SetBoth(None)))
+                } else {
+                    repo.update(cx, |repo, cx| {
+                        repo.load_committed_text(buffer_id, repo_path, cx)
+                    })
+                };
 
                 // todo(lw): hot foreground spawn
                 cx.spawn(async move |this, cx| {
@@ -1174,8 +1195,7 @@ impl GitStore {
         &mut self,
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
-    ) -> Entity<ConflictSet> {
-        log::debug!("open conflict set");
+    ) -> Task<Entity<ConflictSet>> {
         let buffer_id = buffer.read(cx).remote_id();
 
         if let Some(git_state) = self.diffs.get(&buffer_id)
@@ -1188,11 +1208,14 @@ impl GitStore {
             let conflict_set = conflict_set;
             let buffer_snapshot = buffer.read(cx).text_snapshot();
 
-            git_state.update(cx, |state, cx| {
-                let _ = state.reparse_conflict_markers(buffer_snapshot, cx);
+            let rx = git_state.update(cx, |state, cx| {
+                state.reparse_conflict_markers(buffer_snapshot, cx)
             });
 
-            return conflict_set;
+            return cx.spawn(async move |_, _| {
+                rx.await.ok();
+                conflict_set
+            });
         }
 
         let is_unmerged = self
@@ -1210,13 +1233,16 @@ impl GitStore {
                 cx.emit(GitStoreEvent::ConflictsUpdated);
             }));
 
-        buffer_git_state.update(cx, |state, cx| {
+        let rx = buffer_git_state.update(cx, |state, cx| {
             state.conflict_set = Some(conflict_set.downgrade());
             let buffer_snapshot = buffer.read(cx).text_snapshot();
-            let _ = state.reparse_conflict_markers(buffer_snapshot, cx);
+            state.reparse_conflict_markers(buffer_snapshot, cx)
         });
 
-        conflict_set
+        cx.spawn(async move |_, _| {
+            rx.await.ok();
+            conflict_set
+        })
     }
 
     pub fn project_path_git_status(
@@ -1852,14 +1878,18 @@ impl GitStore {
                 {
                     let buffer = buffer.clone();
                     let diff_state = diff_state.clone();
+                    let is_symlink = Self::buffer_is_symlink(&buffer, cx);
 
                     cx.spawn(async move |_git_store, cx| {
                         async {
-                            let diff_bases_change = repo
-                                .update(cx, |repo, cx| {
+                            let diff_bases_change = if is_symlink {
+                                DiffBasesChange::SetBoth(None)
+                            } else {
+                                repo.update(cx, |repo, cx| {
                                     repo.load_committed_text(buffer_id, repo_path, cx)
                                 })
-                                .await?;
+                                .await?
+                            };
 
                             diff_state.update(cx, |diff_state, cx| {
                                 let buffer_snapshot = buffer.read(cx).text_snapshot();
@@ -3661,6 +3691,23 @@ impl GitStore {
             .collect()
     }
 
+    fn coalesce_repo_paths(mut paths: Vec<RepoPath>) -> Vec<RepoPath> {
+        paths.sort();
+
+        let mut coalesced = Vec::with_capacity(paths.len());
+        for path in paths {
+            if coalesced
+                .last()
+                .is_some_and(|ancestor: &RepoPath| path.starts_with(ancestor))
+            {
+                continue;
+            }
+            coalesced.push(path);
+        }
+
+        coalesced
+    }
+
     fn process_updated_entries(
         &self,
         worktree: &Entity<Worktree>,
@@ -3737,6 +3784,10 @@ impl GitStore {
                 }
             }
 
+            for paths in paths_by_git_repo.values_mut() {
+                *paths = Self::coalesce_repo_paths(mem::take(paths));
+            }
+
             paths_by_git_repo
         })
     }
@@ -3788,39 +3839,35 @@ impl BufferGitState {
             return rx;
         };
 
-        let old_snapshot = conflict_set.read_with(cx, |conflict_set, _| {
-            if conflict_set.has_conflict {
-                Some(conflict_set.snapshot())
-            } else {
-                None
-            }
-        });
-
-        if let Some(old_snapshot) = old_snapshot {
-            self.conflict_updated_futures.push(tx);
-            self.reparse_conflict_markers_task = Some(cx.spawn(async move |this, cx| {
-                let (snapshot, changed_range) = cx
-                    .background_spawn(async move {
-                        let new_snapshot = ConflictSet::parse(&buffer);
-                        let changed_range = old_snapshot.compare(&new_snapshot, &buffer);
-                        (new_snapshot, changed_range)
-                    })
-                    .await;
-                this.update(cx, |this, cx| {
-                    if let Some(conflict_set) = &this.conflict_set {
-                        conflict_set
-                            .update(cx, |conflict_set, cx| {
-                                conflict_set.set_snapshot(snapshot, changed_range, cx);
-                            })
-                            .ok();
-                    }
-                    let futures = std::mem::take(&mut this.conflict_updated_futures);
-                    for tx in futures {
-                        tx.send(()).ok();
-                    }
-                })
-            }))
+        let has_conflict = conflict_set.read_with(cx, |conflict_set, _| conflict_set.has_conflict);
+        if !has_conflict {
+            return rx;
         }
+
+        let old_snapshot = conflict_set.read_with(cx, |conflict_set, _| conflict_set.snapshot());
+        self.conflict_updated_futures.push(tx);
+        self.reparse_conflict_markers_task = Some(cx.spawn(async move |this, cx| {
+            let (snapshot, changed_range) = cx
+                .background_spawn(async move {
+                    let new_snapshot = ConflictSet::parse(&buffer);
+                    let changed_range = old_snapshot.compare(&new_snapshot, &buffer);
+                    (new_snapshot, changed_range)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(conflict_set) = &this.conflict_set {
+                    conflict_set
+                        .update(cx, |conflict_set, cx| {
+                            conflict_set.set_snapshot(snapshot, changed_range, cx);
+                        })
+                        .ok();
+                }
+                let futures = std::mem::take(&mut this.conflict_updated_futures);
+                for tx in futures {
+                    tx.send(()).ok();
+                }
+            })
+        }));
 
         rx
     }
@@ -4748,6 +4795,7 @@ impl Repository {
                                 let file = File::from_dyn(buffer.read(cx).file())?;
                                 let abs_path = file.worktree.read(cx).absolutize(&file.path);
                                 let repo_path = this.abs_path_to_repo_path(&abs_path)?;
+                                let is_symlink = GitStore::file_is_symlink(file, cx);
                                 log::debug!(
                                     "start reload diff bases for repo path {}",
                                     repo_path.as_unix_str()
@@ -4765,6 +4813,7 @@ impl Repository {
                                     Some((
                                         buffer,
                                         repo_path,
+                                        is_symlink,
                                         has_unstaged_diff.then(|| diff_state.index_text.clone()),
                                         has_uncommitted_diff.then(|| diff_state.head_text.clone()),
                                     ))
@@ -4777,15 +4826,20 @@ impl Repository {
                 let buffer_diff_base_changes = cx
                     .background_spawn(async move {
                         let mut changes = Vec::new();
-                        for (buffer, repo_path, current_index_text, current_head_text) in
-                            &repo_diff_state_updates
+                        for (
+                            buffer,
+                            repo_path,
+                            is_symlink,
+                            current_index_text,
+                            current_head_text,
+                        ) in &repo_diff_state_updates
                         {
-                            let index_text = if current_index_text.is_some() {
+                            let index_text = if current_index_text.is_some() && !*is_symlink {
                                 backend.load_index_text(repo_path.clone())
                             } else {
                                 future::ready(None).boxed()
                             };
-                            let head_text = if current_head_text.is_some() {
+                            let head_text = if current_head_text.is_some() && !*is_symlink {
                                 backend.load_committed_text(repo_path.clone())
                             } else {
                                 future::ready(None).boxed()
@@ -5248,6 +5302,29 @@ impl Repository {
                 }
             }
         })
+    }
+
+    pub fn file_history_changed_files(
+        &mut self,
+        paths: Vec<RepoPath>,
+        commit_limit: usize,
+    ) -> oneshot::Receiver<Result<Vec<FileHistoryChangedFileSets>>> {
+        self.send_job(
+            "file_history_changed_files",
+            None,
+            move |git_repo, _cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend
+                            .file_history_changed_files(paths, commit_limit)
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("file history changed files is only supported locally")
+                    }
+                }
+            },
+        )
     }
 
     pub fn get_graph_data(
@@ -6344,34 +6421,49 @@ impl Repository {
             move |git_repo, _cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState { fs, .. }) => {
-                        let gitignore_path = work_dir.join(".gitignore");
-
-                        let existing_content = fs.load(&gitignore_path).await.unwrap_or_default();
-
-                        if existing_content
-                            .lines()
-                            .any(|line| line.trim() == file_path_str)
-                        {
-                            return Ok(());
-                        }
-
-                        let new_content = if existing_content.is_empty() {
-                            format!("{}\n", file_path_str)
-                        } else if existing_content.ends_with('\n') {
-                            format!("{}{}\n", existing_content, file_path_str)
-                        } else {
-                            format!("{}\n{}\n", existing_content, file_path_str)
-                        };
-
-                        fs.save(
-                            &gitignore_path,
-                            &text::Rope::from(new_content.as_str()),
-                            text::LineEnding::Unix,
+                        append_pattern_to_ignore_file(
+                            fs,
+                            work_dir.join(".gitignore"),
+                            file_path_str,
                         )
                         .await
                     }
                     RepositoryState::Remote(_) => Err(anyhow::anyhow!(
                         "Cannot modify .gitignore on remote repository"
+                    )),
+                }
+            },
+        )
+    }
+
+    pub fn add_path_to_git_info_exclude(
+        &mut self,
+        repo_path: &RepoPath,
+        is_dir: bool,
+    ) -> oneshot::Receiver<Result<()>> {
+        let repository_dir = self.snapshot.repository_dir_abs_path.clone();
+        let path_display = repo_path.as_ref().display(PathStyle::Posix);
+        let file_path_str = if is_dir {
+            format!("{}/", path_display)
+        } else {
+            path_display.to_string()
+        };
+
+        self.send_job(
+            "add_path_to_git_info_exclude",
+            None,
+            move |git_repo, _cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { fs, .. }) => {
+                        append_pattern_to_ignore_file(
+                            fs,
+                            repository_dir.join(git::REPO_EXCLUDE),
+                            file_path_str,
+                        )
+                        .await
+                    }
+                    RepositoryState::Remote(_) => Err(anyhow::anyhow!(
+                        "Cannot modify .git/info/exclude on remote repository"
                     )),
                 }
             },
@@ -8897,6 +8989,33 @@ fn proto_to_commit_details(proto: &proto::GitCommitDetails) -> CommitDetails {
     }
 }
 
+async fn append_pattern_to_ignore_file(
+    fs: Arc<dyn Fs>,
+    file_path: PathBuf,
+    pattern: String,
+) -> Result<()> {
+    let existing_content = fs.load(&file_path).await.unwrap_or_default();
+
+    if existing_content.lines().any(|line| line.trim() == pattern) {
+        return Ok(());
+    }
+
+    let new_content = if existing_content.is_empty() {
+        format!("{}\n", pattern)
+    } else if existing_content.ends_with('\n') {
+        format!("{}{}\n", existing_content, pattern)
+    } else {
+        format!("{}\n{}\n", existing_content, pattern)
+    };
+
+    fs.save(
+        &file_path,
+        &text::Rope::from(new_content.as_str()),
+        text::LineEnding::Unix,
+    )
+    .await
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl Repository {
     pub fn loaded_commit_data_for_test(&self) -> HashMap<Oid, CommitData> {
@@ -8914,7 +9033,8 @@ impl Repository {
 mod tests {
     use super::*;
     use crate::Project;
-    use fs::FakeFs;
+    use fs::{FakeFs, Fs};
+    use git::repository::{RepoPath, repo_path};
     use gpui::TestAppContext;
     use gpui::proptest::prelude::*;
     use rand::{SeedableRng, rngs::StdRng};
@@ -8927,6 +9047,124 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn test_open_uncommitted_diff_skips_symlinks(cx: &mut TestAppContext) {
+        use util::rel_path::rel_path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "target.txt": "rule one\nrule two\n",
+            }),
+        )
+        .await;
+        fs.insert_symlink("/project/agents.md", PathBuf::from("target.txt"))
+            .await;
+
+        fs.set_head_and_index_for_repo(
+            Path::new("/project/.git"),
+            &[
+                // git stores the symlink's target path as the blob for `agents.md`
+                ("agents.md", "target.txt".into()),
+                ("target.txt", "rule one\n".into()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        // symlink file should not produce a base diff
+        let symlink_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("agents.md")), cx)
+            })
+            .await
+            .unwrap();
+        let symlink_diff = project
+            .update(cx, |project, cx| {
+                project.open_uncommitted_diff(symlink_buffer, cx)
+            })
+            .await
+            .unwrap();
+        symlink_diff.read_with(cx, |diff, _| {
+            assert!(
+                !diff.base_text_exists(),
+                "symlinked buffer should not have a git diff base"
+            );
+        });
+
+        // regular file should still produce a base diff
+        let regular_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("target.txt")), cx)
+            })
+            .await
+            .unwrap();
+        let regular_diff = project
+            .update(cx, |project, cx| {
+                project.open_uncommitted_diff(regular_buffer, cx)
+            })
+            .await
+            .unwrap();
+        regular_diff.read_with(cx, |diff, _| {
+            assert!(
+                diff.base_text_exists(),
+                "regular file should have a git diff base"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_append_pattern_to_ignore_file_creates_and_deduplicates(cx: &mut TestAppContext) {
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let path = PathBuf::from("/root/.gitignore");
+
+        // Appending to a non-existent file creates it with a trailing newline.
+        super::append_pattern_to_ignore_file(fs.clone(), path.clone(), "build/".to_string())
+            .await
+            .unwrap();
+        assert_eq!(fs.load(&path).await.unwrap(), "build/\n");
+
+        // Appending the same pattern again is a no-op (deduplication).
+        super::append_pattern_to_ignore_file(fs.clone(), path.clone(), "build/".to_string())
+            .await
+            .unwrap();
+        assert_eq!(fs.load(&path).await.unwrap(), "build/\n");
+
+        // Appending a distinct pattern adds it with a trailing newline.
+        super::append_pattern_to_ignore_file(fs.clone(), path.clone(), "target/".to_string())
+            .await
+            .unwrap();
+        assert_eq!(fs.load(&path).await.unwrap(), "build/\ntarget/\n");
+    }
+
+    #[gpui::test]
+    async fn test_append_pattern_adds_newline_before_pattern_when_missing(cx: &mut TestAppContext) {
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let path = PathBuf::from("/root/.gitignore");
+
+        // Pre-populate the file without a trailing newline.
+        fs.save(&path, &text::Rope::from("*.log"), text::LineEnding::Unix)
+            .await
+            .unwrap();
+
+        // The new pattern must be written on its own line.
+        super::append_pattern_to_ignore_file(fs.clone(), path.clone(), "build/".to_string())
+            .await
+            .unwrap();
+        assert_eq!(fs.load(&path).await.unwrap(), "*.log\nbuild/\n");
     }
 
     #[test]
@@ -9258,6 +9496,43 @@ mod tests {
                 unexpected_loaded_shas,
             );
         });
+    }
+
+    fn repo_paths(paths: &[&str]) -> Vec<RepoPath> {
+        paths.iter().map(repo_path).collect()
+    }
+
+    #[test]
+    fn coalesce_repo_paths_keeps_root_only() {
+        let coalesced = GitStore::coalesce_repo_paths(repo_paths(&["", "src", "src/lib.rs"]));
+
+        assert_eq!(coalesced, repo_paths(&[""]));
+    }
+
+    #[test]
+    fn coalesce_repo_paths_keeps_existing_ancestors() {
+        let coalesced = GitStore::coalesce_repo_paths(repo_paths(&[
+            "src",
+            "src/lib.rs",
+            "src/nested/file.rs",
+            "tests/test.rs",
+        ]));
+
+        assert_eq!(coalesced, repo_paths(&["src", "tests/test.rs"]));
+    }
+
+    #[test]
+    fn coalesce_repo_paths_does_not_invent_missing_parents() {
+        let coalesced = GitStore::coalesce_repo_paths(repo_paths(&[
+            "submodule/a.txt",
+            "submodule/nested/b.txt",
+            "top_level.rs",
+        ]));
+
+        assert_eq!(
+            coalesced,
+            repo_paths(&["submodule/a.txt", "submodule/nested/b.txt", "top_level.rs"])
+        );
     }
 }
 

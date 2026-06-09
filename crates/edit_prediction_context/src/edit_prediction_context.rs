@@ -20,14 +20,22 @@ use util::rel_path::RelPath;
 use util::{RangeExt as _, ResultExt};
 
 mod assemble_excerpts;
+mod bm25_context;
 #[cfg(test)]
 mod edit_prediction_context_tests;
+mod editable_context;
 #[cfg(test)]
 mod fake_definition_lsp;
+mod git_log_context;
 
-pub use zeta_prompt::{RelatedExcerpt, RelatedFile};
+pub use editable_context::{
+    EditHistoryContextEntry, collect_editable_context, limit_retrieved_context_to_bytes,
+};
+
+pub use zeta_prompt::{ContextSource, RelatedExcerpt, RelatedFile};
 
 const IDENTIFIER_LINE_COUNT: u32 = 3;
+const MAX_CONTEXT_IDENTIFIER_COUNT: usize = 32;
 
 pub struct RelatedExcerptStore {
     project: WeakEntity<Project>,
@@ -252,7 +260,13 @@ impl RelatedExcerptStore {
                         (id, distance)
                     })
                     .collect();
-                identifiers_with_distance.sort_by_key(|(_, distance)| *distance);
+                // Only the closest `MAX_CONTEXT_IDENTIFIER_COUNT` identifiers are
+                // used below, so select that prefix instead of fully sorting.
+                util::truncate_to_bottom_n_sorted_by(
+                    &mut identifiers_with_distance,
+                    MAX_CONTEXT_IDENTIFIER_COUNT,
+                    &|(_, a), (_, b)| a.cmp(b),
+                );
 
                 let mut cursor_distances: HashMap<Identifier, usize> = HashMap::default();
                 let mut current_rank = 0;
@@ -573,6 +587,7 @@ impl RelatedBuffer {
                     row_range: start.row..end.row,
                     text: buffer.text_for_range(start..end).collect::<String>().into(),
                     order,
+                    context_source: ContextSource::Lsp,
                 }
             })
             .collect::<Vec<_>>();
